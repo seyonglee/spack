@@ -31,13 +31,18 @@
   default unorderd dict.
 
 """
+from six import string_types, StringIO
+
 import yaml
 from yaml import Loader, Dumper
 from yaml.nodes import MappingNode, SequenceNode, ScalarNode
 from yaml.constructor import ConstructorError
-from spack.util.ordereddict import OrderedDict
+
+from llnl.util.tty.color import colorize
+from llnl.util.tty.colify import colify
 
 import spack.error
+from spack.util.ordereddict import OrderedDict
 
 # Only export load and dump
 __all__ = ['load', 'dump', 'SpackYAMLError']
@@ -60,10 +65,56 @@ class syaml_str(str):
     __repr__ = str.__repr__
 
 
+class syaml_int(int):
+    __repr__ = str.__repr__
+
+
+#: primitive type -> syaml type mapping
+syaml_types = {
+    syaml_str: string_types,
+    syaml_int: int,
+    syaml_dict: dict,
+    syaml_list: list,
+}
+
+
+def syaml_type(obj):
+    """Get the corresponding syaml wrapper type for a primitive type.
+
+    Return:
+        (object): syaml-typed copy of object, or the obj if no wrapper
+    """
+    for syaml_t, t in syaml_types.items():
+        if type(obj) is not bool and isinstance(obj, t):
+            return syaml_t(obj) if type(obj) != syaml_t else obj
+    return obj
+
+
+def markable(obj):
+    """Whether an object can be marked."""
+    return type(obj) in syaml_types
+
+
 def mark(obj, node):
     """Add start and end markers to an object."""
-    obj._start_mark = node.start_mark
-    obj._end_mark = node.end_mark
+    if not markable(obj):
+        return
+
+    if hasattr(node, 'start_mark'):
+        obj._start_mark = node.start_mark
+    elif hasattr(node, '_start_mark'):
+        obj._start_mark = node._start_mark
+
+    if hasattr(node, 'end_mark'):
+        obj._end_mark = node.end_mark
+    elif hasattr(node, '_end_mark'):
+        obj._end_mark = node._end_mark
+
+
+def marked(obj):
+    """Whether an object has been marked by spack_yaml."""
+    return (hasattr(obj, '_start_mark') and obj._start_mark or
+            hasattr(obj, '_end_mark') and obj._end_mark)
 
 
 class OrderedLineLoader(Loader):
@@ -193,6 +244,7 @@ class OrderedLineDumper(Dumper):
                 node.flow_style = self.default_flow_style
             else:
                 node.flow_style = best_style
+
         return node
 
     def ignore_aliases(self, _data):
@@ -204,6 +256,69 @@ class OrderedLineDumper(Dumper):
 OrderedLineDumper.add_representer(syaml_dict, OrderedLineDumper.represent_dict)
 OrderedLineDumper.add_representer(syaml_list, OrderedLineDumper.represent_list)
 OrderedLineDumper.add_representer(syaml_str, OrderedLineDumper.represent_str)
+OrderedLineDumper.add_representer(syaml_int, OrderedLineDumper.represent_int)
+
+
+def file_line(mark):
+    """Format a mark as <file>:<line> information."""
+    result = mark.name
+    if mark.line:
+        result += ':' + str(mark.line)
+    return result
+
+
+#: Global for interactions between FirstPassDumper and AnnotatedDumper
+#: This is nasty but YAML doesn't give us many ways to pass arguments.
+_annotations = []
+
+
+class FirstPassDumper(OrderedLineDumper):
+    """This is a first pass for AnnotatedDumper.
+
+    Stream is set to devnull so that we can just run through the dump logic.
+
+    Accumulates annotations for each line to be dumped.  We don't know
+    the annotation for a line until the end of the line, so we have to
+    make two passes. The second pass figures out the max annotation width
+    and puts the annotations at the beginning of the line for readability.
+    """
+    saved = None
+
+    def __init__(self, *args, **kwargs):
+        super(FirstPassDumper, self).__init__(*args, **kwargs)
+        del _annotations[:]
+
+    def process_scalar(self):
+        super(FirstPassDumper, self).process_scalar()
+        if marked(self.event.value):
+            self.saved = self.event.value
+
+    def represent_data(self, data):
+        """Force syaml_str to be passed through with marks."""
+        result = super(FirstPassDumper, self).represent_data(data)
+        if isinstance(result.value, string_types):
+            result.value = syaml_str(data)
+        mark(result.value, data)
+        return result
+
+    def write_stream_start(self):
+        super(FirstPassDumper, self).write_stream_start()
+        _annotations.append(colorize('@K{---}'))
+
+    def write_line_break(self):
+        super(FirstPassDumper, self).write_line_break()
+        if not self.saved:
+            return
+
+        # append annotations at the end of each line
+        if self.saved:
+            mark = self.saved._start_mark
+            ann = '@K{%s}' % mark.name
+            if mark.line is not None:
+                ann += ':@c{%s}' % (mark.line + 1)
+            _annotations.append(colorize(ann))
+        else:
+            _annotations.append('')
 
 
 def load(*args, **kwargs):
@@ -214,8 +329,33 @@ def load(*args, **kwargs):
 
 
 def dump(*args, **kwargs):
-    kwargs['Dumper'] = OrderedLineDumper
-    return yaml.dump(*args, **kwargs)
+    blame = kwargs.pop('blame', False)
+
+    if blame:
+        return dump_annotated(*args, **kwargs)
+    else:
+        kwargs['Dumper'] = OrderedLineDumper
+        return yaml.dump(*args, **kwargs)
+
+
+def dump_annotated(data, stream=None, *args, **kwargs):
+    kwargs['Dumper'] = FirstPassDumper
+
+    sio = StringIO()
+    yaml.dump(data, sio, *args, **kwargs)
+    lines = sio.getvalue().split('\n')
+    lines.pop()  # trailing newline
+
+    getvalue = None
+    if stream is None:
+        stream = StringIO()
+        getvalue = stream.getvalue
+
+    # tty=true forces columns even if piped to a non-tty
+    colify(_annotations + lines, cols=2, tty=True, output=stream)
+
+    if getvalue:
+        return getvalue()
 
 
 class SpackYAMLError(spack.error.SpackError):
