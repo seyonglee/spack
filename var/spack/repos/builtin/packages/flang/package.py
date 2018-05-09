@@ -32,17 +32,23 @@ class Flang(CMakePackage):
     homepage = "https://github.com/flang-compiler/flang"
     url      = "https://github.com/flang-compiler/flang/flecsi/tarball/v1.0"
 
-    version('develop', git='https://github.com/flang-compiler/flang', branch='master')
+    version('develop', git='https://github.com/flang-compiler/flang-driver', branch='master')
+    version('develop_legacy', git='https://github.com/flang-compiler/flang', branch='master')
 
+    depends_on("llvm@6:",when="@develop")
+    depends_on("llvm@:5.9999",when="@develop_legacy")
     depends_on(
-            "llvm+clang@4.0.1,5.0.0",
+            "llvm+clang@4.0.1,5.0.0,6:6.9999",
         patches=[
             patch('https://github.com/llvm-mirror/clang/pull/33.diff',
                       sha256='e46d7ab305e5e95c51f4656d9b52058143cd85d859b312b3c80e93a02d54b4a5',
                       when='@4.0.1', level=1, working_dir='tools/clang'),
             patch('https://github.com/llvm-mirror/clang/pull/35.diff',
                       sha256='7f39555783993f78b75c380ca5ef167c1d8b88cc75c6542f6c94e0b6acfb7c5d',
-                      when='@5.0.0', level=1, working_dir='tools/clang')
+                      when='@5.0.0', level=1, working_dir='tools/clang'),
+            patch('https://github.com/llvm-mirror/llvm/pull/56.diff',
+                      sha256='2ee155aa1017766cdae3a860050d82ed48961a2f88bcef760d4922ff25ce381e',
+                      when='@6:6.9999', level=1)
         ]
     )
 
